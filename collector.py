@@ -26,6 +26,30 @@ REQUEST_HEADERS = {
     "Accept-Language": "ko-KR,ko;q=0.9",
 }
 
+BODY_LOG_LIMIT = 4000
+
+
+def _log_request(prepared):
+    """curl -v 스타일로 요청을 로깅합니다."""
+    lines = [f"> {prepared.method} {prepared.url}"]
+    for k, v in prepared.headers.items():
+        lines.append(f"> {k}: {v}")
+    if prepared.body:
+        lines.append(f"> body: {prepared.body!r:.{BODY_LOG_LIMIT}}")
+    logger.info("HTTP 요청\n%s", "\n".join(lines))
+
+
+def _log_response(response):
+    """curl -v 스타일로 응답을 로깅합니다."""
+    lines = [f"< {response.status_code} {response.reason}"]
+    for k, v in response.headers.items():
+        lines.append(f"< {k}: {v}")
+    body = response.text
+    if len(body) > BODY_LOG_LIMIT:
+        body = body[:BODY_LOG_LIMIT] + f"\n... (truncated, total {len(response.text)} chars)"
+    lines.append(f"<\n{body}")
+    logger.info("HTTP 응답\n%s", "\n".join(lines))
+
 
 def collect_via_api():
     """공공데이터포털 API를 통해 주차장 데이터를 수집합니다."""
@@ -37,12 +61,14 @@ def collect_via_api():
         "schAirportCode": config.AIRPORT_CODE,
     }
 
-    response = requests.get(
-        config.PARKING_API_URL,
-        params=params,
-        headers=REQUEST_HEADERS,
-        timeout=15,
+    req = requests.Request(
+        "GET", config.PARKING_API_URL,
+        params=params, headers=REQUEST_HEADERS,
     )
+    prepared = req.prepare()
+    _log_request(prepared)
+    response = requests.Session().send(prepared, timeout=15)
+    _log_response(response)
     response.raise_for_status()
 
     root = ET.fromstring(response.content)
@@ -86,86 +112,67 @@ def collect_via_api():
 
 def collect_via_scraping():
     """김해공항 홈페이지에서 직접 주차장 데이터를 스크래핑합니다."""
-    url = (
-        "https://www.airport.co.kr/gimhae/extra/parkingStatus/"
-        "parkingMain.do"
-    )
+    from bs4 import BeautifulSoup
 
-    response = requests.get(url, headers=REQUEST_HEADERS, timeout=15)
+    url = "https://www.airport.co.kr/gimhae/cms/frCon/index.do?MENU_ID=190"
+
+    req = requests.Request("GET", url, headers=REQUEST_HEADERS)
+    prepared = req.prepare()
+    _log_request(prepared)
+    response = requests.Session().send(prepared, timeout=15)
+    _log_response(response)
     response.raise_for_status()
 
-    # 공항 사이트는 다양한 URL 패턴을 사용하므로 여러 패턴을 시도
-    records = _parse_html_parking_data(response.text)
-
-    if not records:
-        # 대체 URL 시도
-        alt_url = (
-            "https://www.airport.co.kr/gimhae/cms/frCon/"
-            "index.do?MENU_ID=190"
-        )
-        response = requests.get(alt_url, headers=REQUEST_HEADERS, timeout=15)
-        response.raise_for_status()
-        records = _parse_html_parking_data(response.text)
-
-    return records
-
-
-def _parse_html_parking_data(html):
-    """HTML에서 주차장 데이터를 파싱합니다."""
+    soup = BeautifulSoup(response.content, "html.parser")
     records = []
 
-    try:
-        # 주차장 현황 테이블에서 데이터 추출
-        # 일반적인 패턴: 주차장명 | 총 주차면 | 주차중 | 주차가능
-        import re
+    # CSS selector: #contents > article > div.parking-status > ul > li > div > div.label-area
+    for li in soup.select("div.parking-status ul li"):
+        label_area = li.select_one("div.label-area")
+        if not label_area:
+            continue
 
-        # 숫자와 주차장명 패턴 탐색
-        # 주차장 이름 패턴: P1, P2, P3, 국내선, 국제선 등
-        parking_patterns = [
-            r"(P\d[^<]*|국내선[^<]*|국제선[^<]*|여객[^<]*|화물[^<]*)",
-        ]
+        # 주차장명: span.label (예: "P1 여객주차장")
+        name_el = label_area.select_one("span.label")
+        # 잔여 대수: p.num-label (예: "10대")
+        avail_el = label_area.select_one("p.num-label")
+        # 주차율: div.on-progress[data-percent]
+        progress_el = li.select_one("div.on-progress[data-percent]")
 
-        # 테이블 row에서 데이터 추출 시도
-        table_pattern = re.compile(
-            r"<tr[^>]*>.*?</tr>", re.DOTALL | re.IGNORECASE
-        )
-        td_pattern = re.compile(
-            r"<td[^>]*>(.*?)</td>", re.DOTALL | re.IGNORECASE
-        )
+        if not name_el:
+            continue
 
-        for tr_match in table_pattern.finditer(html):
-            tr_html = tr_match.group()
-            tds = td_pattern.findall(tr_html)
+        parking_name = name_el.get_text(strip=True)
 
-            if len(tds) >= 3:
-                name = re.sub(r"<[^>]+>", "", tds[0]).strip()
-                if not name or not any(
-                    kw in name
-                    for kw in ["P1", "P2", "P3", "주차", "국내", "국제", "여객", "화물"]
-                ):
-                    continue
+        # 잔여 대수 파싱 ("10대" → 10)
+        available = 0
+        if avail_el:
+            avail_text = avail_el.get_text(strip=True)
+            available = _parse_int(avail_text.replace("대", ""))
 
-                numbers = []
-                for td in tds[1:]:
-                    cleaned = re.sub(r"<[^>]+>", "", td).strip()
-                    cleaned = cleaned.replace(",", "")
-                    if cleaned.isdigit():
-                        numbers.append(int(cleaned))
-
-                if len(numbers) >= 2:
-                    total = numbers[0]
-                    available = numbers[-1]
+        # data-percent로 총 주차면/주차중 역산
+        total = 0
+        occupied = 0
+        if progress_el:
+            percent = float(progress_el.get("data-percent", "0"))
+            if percent > 0 and available >= 0:
+                # percent = occupied / total * 100
+                # available = total - occupied
+                # → total = available / (1 - percent/100)
+                if percent >= 100:
+                    # 만차: 잔여 0, 총 주차면은 알 수 없으므로 occupied만 기록
+                    occupied = 0
+                    total = 0
+                else:
+                    total = round(available / (1 - percent / 100))
                     occupied = total - available
 
-                    records.append({
-                        "parking_name": name,
-                        "total": total,
-                        "occupied": occupied,
-                        "available": available,
-                    })
-
-    except Exception as e:
-        logger.warning("HTML 파싱 실패: %s", e)
+        records.append({
+            "parking_name": parking_name,
+            "total": total,
+            "occupied": occupied,
+            "available": available,
+        })
 
     return records
 
@@ -209,5 +216,5 @@ def collect_and_store():
         return len(records)
 
     except Exception as e:
-        logger.error("데이터 수집 실패: %s", e)
+        logger.error("데이터 수집 실패: %s", e, exc_info=True)
         raise

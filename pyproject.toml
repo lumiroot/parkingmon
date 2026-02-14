@@ -1,0 +1,11 @@
+[project]
+name = "parkingmon"
+version = "0.1.0"
+description = "김해공항 주차장 실시간 모니터링 시스템"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31.0",
+    "apscheduler>=3.10.0",
+    "flask>=3.0.0",
+    "beautifulsoup4>=4.12.0",
+]

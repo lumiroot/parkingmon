@@ -8,6 +8,7 @@ from flask import Flask, render_template_string
 
 import config
 import db
+from collector import collect_and_store
 
 logging.basicConfig(
     level=logging.INFO,
@@ -124,6 +125,14 @@ DASHBOARD_HTML = """
             color: #999;
             font-size: 1.1rem;
         }
+        .last-collected {
+            text-align: center;
+            padding: 8px 24px 0;
+            max-width: 1200px;
+            margin: 0 auto;
+            color: #888;
+            font-size: 0.85rem;
+        }
         .last-updated {
             text-align: center;
             padding: 8px;
@@ -144,8 +153,10 @@ DASHBOARD_HTML = """
         <button onclick="loadData(24)" class="active" id="btn-24h">24시간</button>
         <button onclick="loadData(72)" id="btn-72h">3일</button>
         <button onclick="loadData(168)" id="btn-168h">7일</button>
+        <button onclick="collectNow()" id="btn-collect" style="border-color:#e15759;color:#e15759;margin-left:16px">수집 실행</button>
     </div>
 
+    <div class="last-collected" id="lastCollected"></div>
     <div class="summary" id="summary"></div>
 
     <div class="chart-container">
@@ -323,11 +334,37 @@ DASHBOARD_HTML = """
 
             if (latest.length > 0) {
                 const t = new Date(latest[0].collected_at);
+                const timeStr = t.toLocaleString('ko-KR');
+                document.getElementById('lastCollected').textContent =
+                    '마지막 수집: ' + timeStr;
                 document.getElementById('lastUpdated').textContent =
-                    '마지막 업데이트: ' + t.toLocaleString('ko-KR');
+                    '마지막 업데이트: ' + timeStr;
             }
         } catch (e) {
             console.error('데이터 로드 실패:', e);
+        }
+    }
+
+    async function collectNow() {
+        const btn = document.getElementById('btn-collect');
+        btn.disabled = true;
+        btn.textContent = '수집 중...';
+        try {
+            const resp = await fetch('/api/collect', { method: 'POST' });
+            const result = await resp.json();
+            if (result.error) {
+                alert('수집 실패: ' + result.error);
+            } else {
+                btn.textContent = result.count + '개 수집 완료';
+                await loadData();
+            }
+        } catch (e) {
+            alert('수집 요청 실패: ' + e);
+        } finally {
+            setTimeout(() => {
+                btn.disabled = false;
+                btn.textContent = '수집 실행';
+            }, 2000);
         }
     }
 
@@ -365,3 +402,12 @@ def api_latest():
 def api_parking_names():
     names = db.get_parking_names()
     return json.dumps(names, ensure_ascii=False)
+
+
+@app.route("/api/collect", methods=["POST"])
+def api_collect():
+    try:
+        count = collect_and_store()
+        return json.dumps({"count": count}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False), 500
